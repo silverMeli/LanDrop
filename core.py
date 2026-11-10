@@ -122,8 +122,11 @@ class Events:
     def local_files(self, paths: list): ...   # archivos recibidos por "Enviar a" / arrastrar al ícono
     def show_window(self): ...
 
-    def ask_accept(self, sender: str, files: list, total: int) -> bool:
-        """Debe devolver True si el usuario acepta. Por defecto rechaza."""
+    def ask_accept(self, sender: str, files: list, total: int, text: str | None = None):
+        """
+        Devuelve True (aceptar), "always" (aceptar y confiar siempre en ese dispositivo)
+        o False (rechazar). Por defecto rechaza.
+        """
         return False
 
 
@@ -139,7 +142,7 @@ class LanDrop:
         if download_dir:
             self.cfg["download_dir"] = str(download_dir)
         self.download_dir = Path(self.cfg["download_dir"])
-        self.instance_id = uuid.uuid4().hex
+        self.instance_id = self.cfg["device_id"]
         self.shared: dict[str, SharedFile] = {}
         self.shared_text = ""
         self.revision = 0
@@ -160,6 +163,8 @@ class LanDrop:
         cfg.setdefault("name", socket.gethostname())
         cfg.setdefault("key", secrets.token_urlsafe(6))
         cfg.setdefault("download_dir", str(default_download_dir()))
+        cfg.setdefault("device_id", uuid.uuid4().hex)
+        cfg.setdefault("trusted", {})  # id -> nombre de dispositivos que no piden confirmación
         self._save_config(cfg)
         return cfg
 
@@ -181,6 +186,15 @@ class LanDrop:
     def set_download_dir(self, d: Path):
         self.download_dir = Path(d)
         self.cfg["download_dir"] = str(d)
+        self._save_config()
+
+    def trust(self, dev_id: str, name: str):
+        self.cfg.setdefault("trusted", {})[dev_id] = name
+        self._save_config()
+        self.events.log(f"{name} ahora es de confianza (no pedirá confirmación).")
+
+    def forget_trusted(self):
+        self.cfg["trusted"] = {}
         self._save_config()
 
     def regenerate_key(self):
@@ -257,6 +271,7 @@ class LanDrop:
 
     def _packet(self, bye=False, reply=False) -> bytes:
         return json.dumps({"app": APP_NAME, "v": 1, "id": self.instance_id, "name": self.name,
+                           "kind": "windows",
                            "port": self.http_port, "bye": bye, "reply": reply}).encode()
 
     def _broadcast_targets(self):
@@ -299,6 +314,7 @@ class LanDrop:
                     new = pid not in self.peers or self.peers[pid]["name"] != msg.get("name")
                     self.peers[pid] = {"id": pid, "name": str(msg.get("name", "PC"))[:40],
                                        "ip": addr[0], "port": int(msg.get("port", HTTP_PORT)),
+                                       "kind": str(msg.get("kind", "windows")),
                                        "seen": time.time()}
                     changed = new
             if changed:
@@ -363,7 +379,7 @@ class LanDrop:
         host, port = peer["ip"], peer["port"]
 
         try:
-            body = json.dumps({"from": self.name,
+            body = json.dumps({"from": self.name, "id": self.instance_id,
                                "files": [{"name": rel, "size": sz} for _, rel, sz in items[:200]],
                                "count": len(items), "total": total}).encode()
             conn = http.client.HTTPConnection(host, port, timeout=ASK_TIMEOUT + 15)
@@ -415,6 +431,21 @@ class LanDrop:
         except OSError:
             pass
         return True, f"Enviado(s) {len(items)} archivo(s) a {peer['name']} ({human_size(total)})"
+
+    def send_text_to_peer(self, peer: dict, text: str):
+        try:
+            body = json.dumps({"from": self.name, "id": self.instance_id, "files": [], "count": 0,
+                               "total": 0, "text": text}).encode()
+            conn = http.client.HTTPConnection(peer["ip"], peer["port"], timeout=ASK_TIMEOUT + 15)
+            conn.request("POST", "/p2p/ask", body, {"Content-Type": "application/json"})
+            resp = json.loads(conn.getresponse().read().decode() or "{}")
+            conn.close()
+        except (OSError, ValueError) as e:
+            return False, f"No se pudo contactar a {peer['name']}: {e}"
+        if resp.get("ok"):
+            return True, f"Texto enviado a {peer['name']}"
+        return False, f"{peer['name']} rechazó el texto" if resp.get("reason") != "timeout" \
+            else f"{peer['name']} no respondió a tiempo"
 
 
 def expand_paths(paths):
@@ -609,22 +640,36 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # ---------- PC a PC (el receptor debe aceptar)
             if route == "/p2p/ask":
                 info = json.loads(self._read_body() or b"{}")
-                sender = str(info.get("from", "PC"))[:40] + f" ({self.client_address[0]})"
+                name = str(info.get("from", "PC"))[:40]
+                sender = name + f" ({self.client_address[0]})"
                 files = info.get("files", [])
                 total = int(info.get("total", 0))
+                text = info.get("text")
+                text = str(text)[:100_000] if text else None
+                dev_id = str(info.get("id", ""))
                 result = {}
-                done = threading.Event()
+                if dev_id and dev_id in app.cfg.get("trusted", {}):
+                    result["ok"] = True
+                    app.events.log(f"{sender} es de confianza: aceptado automáticamente")
+                else:
+                    done = threading.Event()
 
-                def ask():
-                    try:
-                        result["ok"] = bool(app.events.ask_accept(sender, files, total))
-                    finally:
-                        done.set()
-                threading.Thread(target=ask, daemon=True).start()
-                if not done.wait(ASK_TIMEOUT):
-                    return self._send(200, {"ok": False, "reason": "timeout"})
+                    def ask():
+                        try:
+                            result["ok"] = app.events.ask_accept(sender, files, total, text)
+                        finally:
+                            done.set()
+                    threading.Thread(target=ask, daemon=True).start()
+                    if not done.wait(ASK_TIMEOUT):
+                        return self._send(200, {"ok": False, "reason": "timeout"})
+                    if result.get("ok") == "always" and dev_id:
+                        app.trust(dev_id, name)
                 if not result.get("ok"):
                     return self._send(200, {"ok": False, "reason": "declined"})
+                if text:
+                    app.events.text(text, sender)
+                if not files:
+                    return self._send(200, {"ok": True, "ticket": ""})
                 ticket = secrets.token_urlsafe(16)
                 with app.lock:
                     app.tickets[ticket] = {"ip": self.client_address[0], "sender": sender,
@@ -708,7 +753,7 @@ if __name__ == "__main__":
         def text(self, text, sender): print(f"[texto de {sender}] {text}")
         def log(self, msg): print(f"[log] {msg}")
         def peers_changed(self): print("[equipos]", [p["name"] for p in app.peer_list()])
-        def ask_accept(self, sender, files, total):
+        def ask_accept(self, sender, files, total, text=None):
             return input(f"{sender} quiere enviarte {len(files)} archivo(s) ({human_size(total)}). ¿Aceptar? [s/n] ").lower().startswith("s")
 
     app = LanDrop(ConsoleEvents())

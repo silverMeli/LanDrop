@@ -24,6 +24,7 @@ except ImportError:  # sin la librería se muestra solo el enlace
     qrcode = None
 
 IS_WINDOWS = sys.platform == "win32"
+SEARCHING = "Buscando… Abre LanDrop en tu celular Android u otra PC (misma WiFi)."
 FONT = "Segoe UI" if IS_WINDOWS else "Helvetica"
 ACCENT = "#2f6bff"
 BG = "#f3f5f9"
@@ -44,6 +45,11 @@ def open_path(p):
         subprocess.Popen(["open", p])
     else:
         subprocess.Popen(["xdg-open", p])
+
+
+def peer_label(p):
+    kind = {"android": "Android", "windows": "PC"}.get(p.get("kind"), "PC")
+    return f"  {p['name']}    ·  {kind}  ({p['ip']})"
 
 
 def reveal_in_explorer(p):
@@ -79,10 +85,10 @@ class GuiEvents(core.Events):
     def show_window(self):
         self.ui.post(self.ui.bring_to_front)
 
-    def ask_accept(self, sender, files, total):
+    def ask_accept(self, sender, files, total, text=None):
         done = threading.Event()
         result = {}
-        self.ui.post(self.ui.ask_dialog, sender, files, total, done, result)
+        self.ui.post(self.ui.ask_dialog, sender, files, total, done, result, text)
         done.wait(core.ASK_TIMEOUT + 5)
         return result.get("ok", False)
 
@@ -194,6 +200,7 @@ class App:
         self.name_lbl = ttk.Label(top, style="Sub.TLabel")
         self.name_lbl.pack(side="left", padx=14, pady=(6, 0))
         ttk.Button(top, text="Cambiar nombre", command=self.rename).pack(side="right")
+        ttk.Button(top, text="De confianza…", command=self.manage_trusted).pack(side="right", padx=6)
         self._update_name_label()
 
         body = ttk.Frame(r, style="Bg.TFrame", padding=(18, 6, 18, 6))
@@ -221,18 +228,19 @@ class App:
                   style="Muted.TLabel", justify="center").pack(pady=(8, 0))
 
         # --- PCs cercanas
-        peers = self._card(body, "PCs cercanas con LanDrop")
+        peers = self._card(body, "Dispositivos cercanos")
         peers.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
         self.peer_lb = self._listbox(peers, 4)
         self.peer_lb.pack(fill="both", expand=True)
         self.peer_lb.bind("<Double-Button-1>", lambda e: self.send_files_to_peer())
-        self.peer_hint = ttk.Label(peers, text="Buscando otras PCs en tu red…", style="Muted.TLabel")
+        self.peer_hint = ttk.Label(peers, text=SEARCHING, style="Muted.TLabel")
         self.peer_hint.pack(anchor="w", pady=(6, 6))
         row = ttk.Frame(peers, style="Card.TFrame")
         row.pack(fill="x")
         ttk.Button(row, text="Enviar archivos…", style="Accent.TButton",
                    command=self.send_files_to_peer).pack(side="left")
         ttk.Button(row, text="Enviar carpeta…", command=self.send_folder_to_peer).pack(side="left", padx=6)
+        ttk.Button(row, text="Enviar portapapeles", command=self.send_clipboard_to_peer).pack(side="left")
 
         # --- compartir con el celular
         share = self._card(body, "Enviar al celular")
@@ -380,9 +388,9 @@ class App:
         self.peers = self.core.peer_list()
         self.peer_lb.delete(0, "end")
         for p in self.peers:
-            self.peer_lb.insert("end", f"  {p['name']}    ({p['ip']})")
-        self.peer_hint.configure(text="Doble clic en una PC para enviarle archivos." if self.peers
-                                 else "Buscando otras PCs en tu red…")
+            self.peer_lb.insert("end", peer_label(p))
+        self.peer_hint.configure(text="Doble clic en un dispositivo para enviarle archivos." if self.peers
+                                 else SEARCHING)
         if self.chooser and self.chooser.win.winfo_exists():
             self.chooser.refresh()
 
@@ -393,8 +401,8 @@ class App:
             return peers[sel[0]]
         if len(peers) == 1:
             return peers[0]
-        messagebox.showinfo("LanDrop", "Selecciona primero una PC de la lista." if peers else
-                            "No hay otras PCs con LanDrop abierto en esta red.")
+        messagebox.showinfo("LanDrop", "Selecciona primero un dispositivo de la lista." if peers else
+                            "No hay dispositivos con LanDrop abierto en esta red.")
         return None
 
     def send_files_to_peer(self):
@@ -454,12 +462,42 @@ class App:
             if msg != "Envío cancelado":
                 messagebox.showwarning("LanDrop", msg)
 
+    def send_clipboard_to_peer(self):
+        peer = self._selected_peer()
+        if not peer:
+            return
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            messagebox.showinfo("LanDrop", "El portapapeles no tiene texto.")
+            return
+        self.log(f"Enviando texto a {peer['name']}…")
+
+        def work():
+            ok, msg = self.core.send_text_to_peer(peer, text)
+            self.post(self.log, msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def manage_trusted(self):
+        trusted = self.core.cfg.get("trusted", {})
+        if not trusted:
+            messagebox.showinfo("De confianza", "No hay dispositivos de confianza.\n\nAl recibir algo, "
+                                "marca \"Aceptar siempre de este dispositivo\" para no tener que confirmar.")
+            return
+        names = "\n".join(f"• {n}" for n in trusted.values())
+        if messagebox.askyesno("De confianza", f"Estos dispositivos envían sin pedir confirmación:\n\n"
+                                               f"{names}\n\n¿Quitarlos a todos?"):
+            self.core.forget_trusted()
+            self.log("Se quitaron los dispositivos de confianza.")
+
     def cancel_send(self):
         if self.cancel_event:
             self.cancel_event.set()
 
     # ---------------- solicitud entrante de otra PC
-    def ask_dialog(self, sender, files, total, done, result):
+    def ask_dialog(self, sender, files, total, done, result, text=None):
         self.bring_to_front()
         w = tk.Toplevel(self.root)
         w.title("Archivos entrantes")
@@ -470,12 +508,21 @@ class App:
         f = ttk.Frame(w, style="Card.TFrame", padding=20)
         f.pack(fill="both")
         ttk.Label(f, text=f"{sender}", style="H.TLabel").pack(anchor="w")
-        ttk.Label(f, text=f"quiere enviarte {len(files)} archivo(s) · {core.human_size(total)}",
-                  style="Card.TLabel").pack(anchor="w", pady=(2, 10))
+        if files:
+            what = f"quiere enviarte {len(files)} archivo(s) · {core.human_size(total)}"
+        else:
+            what = "quiere enviarte un texto (se copiará al portapapeles)"
+        ttk.Label(f, text=what, style="Card.TLabel").pack(anchor="w", pady=(2, 10))
         names = [x.get("name", "?") for x in files[:6]]
         if len(files) > 6:
             names.append(f"… y {len(files) - 6} más")
-        ttk.Label(f, text="\n".join(names), style="Muted.TLabel", justify="left").pack(anchor="w")
+        if text:
+            names.append(text if len(text) <= 200 else text[:197] + "…")
+        ttk.Label(f, text="\n".join(names), style="Muted.TLabel", justify="left",
+                  wraplength=380).pack(anchor="w")
+        always = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Aceptar siempre de este dispositivo", variable=always,
+                        style="Card.TCheckbutton").pack(anchor="w", pady=(10, 0))
         timer = ttk.Label(f, style="Muted.TLabel")
         timer.pack(anchor="w", pady=(10, 0))
         row = ttk.Frame(f, style="Card.TFrame")
@@ -483,11 +530,11 @@ class App:
 
         def answer(ok):
             if not done.is_set():
-                result["ok"] = ok
+                result["ok"] = ("always" if always.get() else True) if ok else False
                 done.set()
             if w.winfo_exists():
                 w.destroy()
-            if ok:
+            if ok and files:
                 self.log(f"Aceptaste archivos de {sender}.")
                 self.status.configure(text=f"Recibiendo de {sender}…")
 
@@ -671,9 +718,9 @@ class TargetChooser:
         sel = self.lb.curselection()
         self.targets = [None] + self.app.core.peer_list()  # None = celular
         self.lb.delete(0, "end")
-        self.lb.insert("end", "  Celular (aparecerá en la página del QR)")
+        self.lb.insert("end", "  Celular sin la app (página del QR)")
         for p in self.targets[1:]:
-            self.lb.insert("end", f"  PC: {p['name']}    ({p['ip']})")
+            self.lb.insert("end", peer_label(p))
         if sel and sel[0] < len(self.targets):
             self.lb.selection_set(sel[0])
 

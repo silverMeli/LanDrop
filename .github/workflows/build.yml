@@ -2,6 +2,9 @@ name: Compilar LanDrop.exe
 
 on:
   push:
+    paths-ignore:
+      - "android/**"
+      - ".github/workflows/android.yml"
   workflow_dispatch:
 
 jobs:
